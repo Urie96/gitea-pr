@@ -7,7 +7,7 @@
 //
 //   INPUT_TOKEN=... INPUT_HEAD=... INPUT_TITLE=... node index.js
 //
-// Requires: node >= 18 (global fetch) and git. Dependency-free on purpose: no
+// Requires: node >= 18 (global fetch). Dependency-free on purpose: no
 // package.json, no node_modules, nothing to build.
 //
 // Exits 0 for "PR opened / reused / nothing to do", non-zero only for real
@@ -16,7 +16,6 @@
 "use strict";
 
 const fs = require("node:fs");
-const { spawnSync } = require("node:child_process");
 
 const log = (message) => process.stderr.write(`[gitea-pr] ${message}\n`);
 
@@ -55,7 +54,7 @@ const labels = input("labels");
 const mergeMethod = input("merge-method", "default");
 const autoMerge = flag("auto-merge");
 const deleteBranch = flag("delete-branch");
-const commitMessage = input("commit-message");
+const labelColor = input("label-color", "#ededed");
 
 const api = `${server}/api/v1/repos/${repo}`;
 
@@ -97,24 +96,6 @@ async function call(method, path, payload) {
 const describe = (payload) =>
   typeof payload?.message === "string" ? payload.message : JSON.stringify(payload);
 
-function run(command, args) {
-  const result = spawnSync(command, args, { stdio: "inherit" });
-  if (result.status !== 0) {
-    throw new Error(`${command} ${args.join(" ")} failed with status ${result.status}`);
-  }
-}
-
-/** Commit the working tree to `head` and push it (opt-in via commit-message). */
-function pushHeadBranch() {
-  if (!commitMessage) return;
-  run("git", ["add", "-A"]);
-  const clean =
-    spawnSync("git", ["diff", "--cached", "--quiet"], { stdio: "ignore" }).status === 0;
-  if (clean) log("working tree unchanged; pushing HEAD as is");
-  else run("git", ["commit", "-m", commitMessage]);
-  run("git", ["push", "--force", "origin", `HEAD:refs/heads/${headBranch}`]);
-}
-
 /**
  * A missing head branch is a normal outcome for a scheduled job: nothing was
  * pushed yet, the branch was renamed, or the previous PR was merged and its
@@ -154,23 +135,64 @@ async function findOpenPr() {
   return found ? found.number : null;
 }
 
-/** Label IDs for the `labels` input (Gitea wants IDs, not names). */
+/** All labels of the repository, across pages (the API caps the page size). */
+async function listLabels() {
+  const all = [];
+  const pageSize = 50;
+  for (let page = 1; page <= 20; page += 1) {
+    const { status, body } = await call("GET", `/labels?page=${page}&limit=${pageSize}`);
+    if (status !== 200 || !Array.isArray(body)) {
+      throw new Error(`listing labels failed: HTTP ${status} ${describe(body)}`);
+    }
+    all.push(...body);
+    if (body.length < pageSize) return all;
+  }
+  throw new Error("listing labels failed: too many pages");
+}
+
+/**
+ * Label IDs for the `labels` input (Gitea wants IDs, not names). Labels that
+ * do not exist yet are created with `label-color`, which keeps the workflow
+ * self-contained: adding a name to `labels` is enough.
+ */
 async function labelIds() {
   const wanted = labels
-    .split(",")
+    .split(/[\n,]/)
     .map((label) => label.trim())
     .filter(Boolean);
   if (wanted.length === 0) return [];
 
-  const { status, body: all } = await call("GET", "/labels?limit=50");
-  if (status !== 200 || !Array.isArray(all)) {
-    throw new Error(`listing labels failed: HTTP ${status} ${describe(all)}`);
+  const known = await listLabels();
+  const ids = [];
+  for (const name of wanted) {
+    const existing = known.find((candidate) => candidate.name === name);
+    if (existing) {
+      ids.push(existing.id);
+      continue;
+    }
+
+    const { status, body: created } = await call("POST", "/labels", {
+      name,
+      color: labelColor,
+    });
+    if (status === 200 || status === 201) {
+      log(`created label '${name}' (#${created.id})`);
+      known.push(created);
+      ids.push(created.id);
+      continue;
+    }
+
+    // A concurrent run may have created the label after our listing; Gitea
+    // answers such a duplicate with a 5xx instead of a 409.
+    const raced = (await listLabels()).find((candidate) => candidate.name === name);
+    if (raced) {
+      known.push(raced);
+      ids.push(raced.id);
+      continue;
+    }
+    throw new Error(`creating label '${name}' failed: HTTP ${status} ${describe(created)}`);
   }
-  return wanted.map((name) => {
-    const label = all.find((candidate) => candidate.name === name);
-    if (!label) throw new Error(`label '${name}' does not exist in ${repo}`);
-    return label.id;
-  });
+  return ids;
 }
 
 async function resolveMergeMethod() {
@@ -226,7 +248,6 @@ function writeOutput(values) {
 }
 
 async function main() {
-  pushHeadBranch();
   if (!(await headBranchExists())) return;
 
   let number = await findOpenPr();

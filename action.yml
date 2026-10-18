@@ -14,7 +14,7 @@ inputs:
       would never run and the auto-merge would wait forever.
     required: true
   head:
-    description: Source branch. It must exist on the remote unless `commit-message` is set.
+    description: Source branch. It must already be pushed to the remote.
     required: true
   base:
     description: Target branch.
@@ -29,10 +29,16 @@ inputs:
     default: ''
   labels:
     description: >-
-      Comma-separated label names to set on the pull request. The labels must
-      already exist on the repository (the Gitea API takes label IDs).
+      Label names to set on the pull request, separated by commas or newlines
+      (use a block scalar for one label per line). Labels that do not exist in
+      the repository yet are created with `label-color`.
     required: false
     default: ''
+  label-color:
+    description: >-
+      Color of labels created for `labels`, as `#rrggbb`.
+    required: false
+    default: '#ededed'
   merge-method:
     description: >-
       merge, squash, rebase, rebase-merge, or `default` to use the repository
@@ -48,14 +54,6 @@ inputs:
     description: Delete the source branch after the merge.
     required: false
     default: 'true'
-  commit-message:
-    description: >-
-      If set, commit the current working tree to `head` and force-push it
-      before opening the pull request. Leave empty when the workflow already
-      committed and pushed the branch (recommended: it lets you skip the step
-      entirely when nothing changed).
-    required: false
-    default: ''
   server-url:
     description: Gitea base URL. Defaults to ${{ github.server_url }}.
     required: false
@@ -85,10 +83,10 @@ runs:
         INPUT_TITLE: ${{ inputs.title }}
         INPUT_BODY: ${{ inputs.body }}
         INPUT_LABELS: ${{ inputs.labels }}
+        INPUT_LABEL_COLOR: ${{ inputs.label-color }}
         INPUT_MERGE_METHOD: ${{ inputs.merge-method }}
         INPUT_AUTO_MERGE: ${{ inputs.auto-merge }}
         INPUT_DELETE_BRANCH: ${{ inputs.delete-branch }}
-        INPUT_COMMIT_MESSAGE: ${{ inputs.commit-message }}
         INPUT_SERVER_URL: ${{ inputs.server-url }}
         INPUT_REPOSITORY: ${{ inputs.repository }}
       run: node "${GITHUB_ACTION_PATH}/index.js"

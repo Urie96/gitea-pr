@@ -19,7 +19,7 @@ request again and re-schedules the auto-merge instead of failing.
 
 ## Requirements
 
-- `node >= 18` (for the global `fetch`) and `git` in the job environment; the
+- `node >= 20` (global `fetch`, stable) and `git` in the job environment; the
   script is dependency-free (no `package.json`, no `node_modules`, nothing to
   build)
 - the `head` branch pushed beforehand (or use `commit-message`, see below)

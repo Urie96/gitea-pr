@@ -56,6 +56,9 @@ const autoMerge = flag("auto-merge");
 const deleteBranch = flag("delete-branch");
 const labelColor = input("label-color", "#ededed");
 
+/** How long to wait for Gitea to finish computing a new PR's mergeability. */
+const MERGEABLE_TIMEOUT_MS = 120_000;
+
 const api = `${server}/api/v1/repos/${repo}`;
 
 /** Encode a ref for a URL without escaping the slashes Gitea routes on. */
@@ -64,7 +67,7 @@ const encodeRef = (ref) => ref.split("/").map(encodeURIComponent).join("/");
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Call the Gitea API; never throws for HTTP errors, returns { status, body }. */
-async function call(method, path, payload) {
+async function call(method, path, payload, { raw = false } = {}) {
   const headers = {
     Authorization: `token ${token}`,
     Accept: "application/json",
@@ -84,6 +87,7 @@ async function call(method, path, payload) {
   }
 
   const text = await response.text();
+  if (raw) return { status: response.status, body: text };
   let parsed;
   try {
     parsed = text.trim() ? JSON.parse(text) : {};
@@ -95,6 +99,14 @@ async function call(method, path, payload) {
 
 const describe = (payload) =>
   typeof payload?.message === "string" ? payload.message : JSON.stringify(payload);
+
+let repositoryCache;
+
+/** The repository object, fetched once: several checks need it. */
+async function getRepository() {
+  if (repositoryCache === undefined) repositoryCache = await call("GET", "");
+  return repositoryCache;
+}
 
 /**
  * A missing head branch is a normal outcome for a scheduled job: nothing was
@@ -109,7 +121,7 @@ async function headBranchExists() {
   if (status === 200) return true;
   if (status === 404) {
     // Tell "the branch is gone" apart from "the repository slug is wrong".
-    const repository = await call("GET", "");
+    const repository = await getRepository();
     if (repository.status !== 200) {
       throw new Error(
         `repository ${repo} is not reachable: HTTP ${repository.status} ${describe(repository.body)}`,
@@ -125,6 +137,17 @@ async function headBranchExists() {
 async function findOpenPr() {
   const { status, body: pulls } = await call("GET", "/pulls?state=open&limit=50");
   if (status !== 200 || !Array.isArray(pulls)) {
+    // A repository with its "Pull Requests" unit switched off answers 404 and
+    // `{"message":"not found"}`, which reads like a wrong URL. Name the actual
+    // cause instead of leaving the user to guess.
+    if (status === 404) {
+      const repository = await getRepository();
+      if (repository.status === 200 && repository.body?.has_pull_requests === false) {
+        throw new Error(
+          `the 'Pull Requests' unit is disabled for ${repo}; enable it in the repository settings (Settings -> Advanced Settings)`,
+        );
+      }
+    }
     throw new Error(`listing pull requests failed: HTTP ${status} ${describe(pulls)}`);
   }
   // `head` as a query parameter is not honoured by every Gitea version, so the
@@ -133,6 +156,45 @@ async function findOpenPr() {
     (pull) => pull.head?.ref === headBranch && pull.base?.ref === base,
   );
   return found ? found.number : null;
+}
+
+/**
+ * Whether `headBranch` would add anything to `base` at all.
+ *
+ * Gitea happily creates a pull request for two identical branches (the PR then
+ * just says "empty", with no diff), which is noise for a nightly job. The
+ * compare API answers that question directly: `base...head` lists the commits
+ * reachable from `head` but not from `base` (`merge-base..head`), which is
+ * exactly what the pull request would contain.
+ *
+ * @returns {Promise<boolean>} true when there is nothing to open
+ */
+async function nothingToMerge() {
+  const range = `${encodeRef(base)}...${encodeRef(headBranch)}`;
+
+  const compared = await call("GET", `/compare/${range}`);
+  if (compared.status !== 200 || typeof compared.body?.total_commits !== "number") {
+    log(
+      `comparing ${base}...${headBranch} failed: HTTP ${compared.status} ${describe(compared.body)}; opening the pull request anyway`,
+    );
+    return false;
+  }
+  if (compared.body.total_commits > 0) return false;
+
+  // Zero commits also happens when the branches share no history at all (the
+  // comparison is empty then), where a pull request may still be wanted, so
+  // confirm with the diff itself: an empty diff means nothing to merge.
+  const diff = await call("GET", `/compare/${range}?output=diff`, undefined, { raw: true });
+  if (diff.status !== 200) {
+    log(
+      `reading the diff of ${base}...${headBranch} failed: HTTP ${diff.status}; opening the pull request anyway`,
+    );
+    return false;
+  }
+  if (diff.body.trim() !== "") return false;
+
+  log(`${headBranch} adds no commits and no changes on top of ${base}; nothing to open`);
+  return true;
 }
 
 /** All labels of the repository, across pages (the API caps the page size). */
@@ -197,9 +259,30 @@ async function labelIds() {
 
 async function resolveMergeMethod() {
   if (mergeMethod !== "default") return mergeMethod;
-  const { status, body: repository } = await call("GET", "");
+  const { status, body: repository } = await getRepository();
   const style = status === 200 ? repository?.default_merge_style : "";
   return style || "merge";
+}
+
+/**
+ * Which merge styles the repository allows, for the error message of a rejected
+ * merge: a repository with every style switched off can still have PRs, and the
+ * API only answers `405 merge is not allowed for this repository`.
+ */
+async function allowedMergeStyles() {
+  const { status, body: repository } = await getRepository();
+  if (status !== 200) return "";
+  const enabled = [
+    ["merge", repository.allow_merge_commits],
+    ["squash", repository.allow_squash_merge],
+    ["rebase", repository.allow_rebase || repository.allow_rebase_explicit],
+    ["fast-forward-only", repository.allow_fast_forward_only_merge],
+  ]
+    .filter(([, allowed]) => allowed)
+    .map(([style]) => style);
+  return enabled.length === 0
+    ? " (no merge style is enabled in the repository settings)"
+    : ` (merge styles enabled: ${enabled.join(", ")})`;
 }
 
 /**
@@ -227,15 +310,56 @@ async function scheduleAutoMerge(number) {
       log(`pull request #${number}: already merged or already scheduled`);
       return;
     }
-    // "Please try again later" means the PR is still in its mergeability check.
+    // A push may have moved the head between the readiness poll and this call,
+    // which puts the PR back into "checking". Retrying is cheaper than failing.
     if (status === 405 && /try again later/i.test(message) && attempt < maxAttempts) {
       log(`pull request #${number} is still being checked; retrying`);
       await sleep(2000);
       continue;
     }
+    if (status === 405) {
+      throw new Error(
+        `scheduling auto-merge failed: HTTP ${status} ${message}${await allowedMergeStyles()}`,
+      );
+    }
     throw new Error(`scheduling auto-merge failed: HTTP ${status} ${message}`);
   }
   throw new Error("scheduling auto-merge failed: still 'try again later'");
+}
+
+/**
+ * Gitea computes the mergeability of a new PR in a background job, and until it
+ * finishes the merge endpoint answers `405 Please try again later`
+ * (services/pull.CheckPullMergeable -> ErrNotMergeableState). Poll the PR rather
+ * than hammering the merge endpoint: the API's `mergeable` is false while the
+ * check runs, on a conflict and on a check error.
+ *
+ * @returns {Promise<"mergeable" | "gone" | "stuck">}
+ */
+async function waitForMergeable(number) {
+  const deadline = Date.now() + MERGEABLE_TIMEOUT_MS;
+  let delay = 1000;
+  let waiting = false;
+
+  for (;;) {
+    const { status, body: pull } = await call("GET", `/pulls/${number}`);
+    if (status !== 200) {
+      throw new Error(`reading pull request #${number} failed: HTTP ${status} ${describe(pull)}`);
+    }
+    if (pull.state !== "open") {
+      log(`pull request #${number} is ${pull.state}; not scheduling a merge`);
+      return "gone";
+    }
+    if (pull.mergeable) return "mergeable";
+
+    if (Date.now() + delay > deadline) return "stuck";
+    if (!waiting) {
+      log(`pull request #${number} is still being checked by Gitea; waiting for it`);
+      waiting = true;
+    }
+    await sleep(delay);
+    delay = Math.min(delay * 2, 5000);
+  }
 }
 
 function writeOutput(values) {
@@ -256,6 +380,8 @@ async function main() {
   if (number !== null) {
     log(`pull request #${number} is already open for ${headBranch} -> ${base}`);
   } else {
+    if (await nothingToMerge()) return;
+
     const ids = await labelIds();
     const payload = { head: headBranch, base, title, body };
     if (ids.length > 0) payload.labels = ids;
@@ -295,6 +421,15 @@ async function main() {
   if (!autoMerge) {
     log("auto-merge disabled");
     return;
+  }
+
+  const readiness = await waitForMergeable(number);
+  if (readiness === "gone") return;
+  if (readiness === "stuck") {
+    throw new Error(
+      `pull request #${number} did not become mergeable within ${MERGEABLE_TIMEOUT_MS / 1000}s: ` +
+        "Gitea is still checking it, it has a merge conflict, or its title marks it as work in progress",
+    );
   }
   await scheduleAutoMerge(number);
 }

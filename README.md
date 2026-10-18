@@ -18,6 +18,11 @@ bump, generated docs, …).
 It is idempotent: re-running it on an unchanged branch finds the open pull
 request again and re-schedules the auto-merge instead of failing.
 
+It also stays quiet when there is nothing to merge: before opening anything it
+compares `base...head` (commits on top of the base, then the raw diff), so a
+nightly job over an unchanged branch logs "nothing to open" and exits 0
+instead of leaving an empty pull request behind.
+
 ## Requirements
 
 - `node >= 20` (global `fetch`, stable) in the job environment; the script is
@@ -167,16 +172,41 @@ Gitea stores that in `pull_auto_merge` and re-evaluates it when the PR becomes
 mergeable and whenever a commit status turns `success`, so scheduling it right
 after creating the PR is safe even though no check has run yet.
 
+Gitea computes a new PR's mergeability in a background job, and until that job
+finishes the merge endpoint answers `405 Please try again later`
+(`services/pull.CheckPullMergeable` -> `ErrNotMergeableState`, returned for a
+*checking* PR as well as for a conflicting one). The script therefore polls
+`GET /repos/{owner}/{repo}/pulls/{number}` until the API reports
+`mergeable: true` (up to 120 s, 1 s -> 5 s backoff) before scheduling, instead of
+hammering the merge endpoint. The schedule is only attempted once the PR is
+ready; if it never becomes ready the run fails with the reason (still checking,
+merge conflict, or a work-in-progress title).
+
 Handled as success (all of these exit 0, so a scheduled job stays green):
 
 - `404` on the head branch: nothing pushed yet, branch renamed, or already
   merged and deleted. The repository itself is probed first, so a typo in the
   repository slug is still an error.
+- `head` adds no commits and an empty diff on top of `base`
+  (`GET /compare/{base}...{head}`): nothing to open, so no pull request is
+  created. A comparison that cannot be read (5xx, unrelated histories) is not
+  treated as "empty": the pull request is opened and Gitea decides.
 - `409` (already merged or already scheduled).
-- `405` with "try again later": the PR is still being checked; retried up to 6
-  times.
+- `405` with "try again later": a push moved the head between the readiness poll
+  and the merge call, so the PR is "checking" again; retried up to 5 times.
 - `422` "no commits/changes": the branch is identical to the base.
 - an existing open PR for the same `head`/`base` is reused.
+- the PR was merged or closed while waiting for it to become mergeable.
+
+Two failures that read like something else are named explicitly:
+
+- `404` while listing pull requests: if the repository reports
+  `has_pull_requests: false`, the error says that the "Pull Requests" unit is
+  disabled in the repository settings. Gitea answers `404 not found` (not
+  `403`) for switched-off units, which otherwise looks like a wrong URL.
+- `405` while scheduling the merge without "try again later": the error lists
+  the merge styles the repository allows, so a mismatch between `merge-method`
+  and the repository settings does not need a manual `GET /repos/...`.
 
 Notes:
 

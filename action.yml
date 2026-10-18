@@ -1,0 +1,92 @@
+name: Gitea PR
+description: >-
+  Open (or reuse) a pull request on Gitea/Forgejo and schedule it to be merged
+  as soon as the required checks pass.
+
+inputs:
+  token:
+    description: >-
+      Personal access token of a real user or bot account. Do NOT pass
+      secrets.GITEA_TOKEN / github.token: the job token acts as `gitea-actions`
+      and events caused by it never trigger workflows, so the required check
+      would never run and the auto-merge would wait forever.
+    required: true
+  head:
+    description: Source branch. It must exist on the remote unless `commit-message` is set.
+    required: true
+  base:
+    description: Target branch.
+    required: false
+    default: main
+  title:
+    description: Pull request title.
+    required: true
+  body:
+    description: Pull request description.
+    required: false
+    default: ''
+  labels:
+    description: >-
+      Comma-separated label names to set on the pull request. The labels must
+      already exist on the repository (the Gitea API takes label IDs).
+    required: false
+    default: ''
+  merge-method:
+    description: >-
+      merge, squash, rebase, rebase-merge, or `default` to use the repository
+      default. `fast-forward-only` is not supported: it ignores
+      merge_when_checks_succeed on some Gitea versions.
+    required: false
+    default: default
+  auto-merge:
+    description: Schedule the merge to happen once the required checks pass.
+    required: false
+    default: 'true'
+  delete-branch:
+    description: Delete the source branch after the merge.
+    required: false
+    default: 'true'
+  commit-message:
+    description: >-
+      If set, commit the current working tree to `head` and force-push it
+      before opening the pull request. Leave empty when the workflow already
+      committed and pushed the branch (recommended: it lets you skip the step
+      entirely when nothing changed).
+    required: false
+    default: ''
+  server-url:
+    description: Gitea base URL. Defaults to ${{ github.server_url }}.
+    required: false
+    default: ''
+  repository:
+    description: Repository as owner/name. Defaults to ${{ github.repository }}.
+    required: false
+    default: ''
+
+outputs:
+  number:
+    description: Pull request number.
+    value: ${{ steps.pr.outputs.number }}
+  url:
+    description: Pull request URL.
+    value: ${{ steps.pr.outputs.url }}
+
+runs:
+  using: composite
+  steps:
+    - id: pr
+      shell: bash
+      env:
+        INPUT_TOKEN: ${{ inputs.token }}
+        INPUT_HEAD: ${{ inputs.head }}
+        INPUT_BASE: ${{ inputs.base }}
+        INPUT_TITLE: ${{ inputs.title }}
+        INPUT_BODY: ${{ inputs.body }}
+        INPUT_LABELS: ${{ inputs.labels }}
+        INPUT_MERGE_METHOD: ${{ inputs.merge-method }}
+        INPUT_AUTO_MERGE: ${{ inputs.auto-merge }}
+        INPUT_DELETE_BRANCH: ${{ inputs.delete-branch }}
+        INPUT_COMMIT_MESSAGE: ${{ inputs.commit-message }}
+        INPUT_SERVER_URL: ${{ inputs.server-url }}
+        INPUT_REPOSITORY: ${{ inputs.repository }}
+      run: bash "${GITHUB_ACTION_PATH}/create-pr.sh"

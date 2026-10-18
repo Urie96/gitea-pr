@@ -19,7 +19,9 @@ request again and re-schedules the auto-merge instead of failing.
 
 ## Requirements
 
-- `bash`, `curl`, `jq` and `git` in the job environment
+- `node >= 18` (for the global `fetch`) and `git` in the job environment; the
+  script is dependency-free (no `package.json`, no `node_modules`, nothing to
+  build)
 - the `head` branch pushed beforehand (or use `commit-message`, see below)
 - a **personal access token of a real user or bot account**
 
@@ -90,6 +92,23 @@ Outputs: `number`, `url`.
     head: update/flake-inputs
     base: main
     title: chore(flake): update flake inputs
+    merge-method: merge
+```
+
+## Example: nightly PR from a long-lived branch
+
+With the no-ops above, a "merge whatever is on `daily` into `main` once a day"
+job needs no shell at all — the action skips itself when `daily` is missing or
+already contained in `main`:
+
+```yaml
+- uses: actions/checkout@v4
+- uses: https://git.lubui.com:8443/urie/gitea-pr@v1
+  with:
+    token: ${{ secrets.BOT_TOKEN }}
+    head: daily
+    base: main
+    title: Nightly merge daily into main
     merge-method: merge
 ```
 

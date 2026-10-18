@@ -91,4 +91,4 @@ runs:
         INPUT_COMMIT_MESSAGE: ${{ inputs.commit-message }}
         INPUT_SERVER_URL: ${{ inputs.server-url }}
         INPUT_REPOSITORY: ${{ inputs.repository }}
-      run: bash "${GITHUB_ACTION_PATH}/create-pr.sh"
+      run: node "${GITHUB_ACTION_PATH}/index.js"

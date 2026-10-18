@@ -101,6 +101,22 @@ label_id_list() {
 
 push_head_branch
 
+# A missing head branch is a normal outcome for a scheduled job: nothing was
+# pushed yet, the branch was renamed, or the previous PR was merged and its
+# branch deleted. Do not turn that into a failed run.
+request GET "/branches/$head_branch"
+case "$status" in
+  200) ;;
+  404)
+    # Tell "the branch is gone" apart from "the repository slug is wrong".
+    request GET ""
+    [ "$status" = 200 ] || die "repository $repo is not reachable: HTTP $status ${response}"
+    log "branch '$head_branch' does not exist in $repo; nothing to open"
+    exit 0
+    ;;
+  *) die "checking branch '$head_branch' failed: HTTP $status ${response}" ;;
+esac
+
 number=$(find_open_pr)
 pr_url=""
 if [ -n "$number" ]; then

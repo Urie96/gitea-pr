@@ -121,9 +121,16 @@ Gitea stores that in `pull_auto_merge` and re-evaluates it when the PR becomes
 mergeable and whenever a commit status turns `success`, so scheduling it right
 after creating the PR is safe even though no check has run yet.
 
-Handled as success: `409` (already merged or already scheduled), `405` with
-"try again later" (the PR is still being checked; retried up to 6 times),
-`422` "no commits/changes" (nothing to open).
+Handled as success (all of these exit 0, so a scheduled job stays green):
+
+- `404` on the head branch: nothing pushed yet, branch renamed, or already
+  merged and deleted. The repository itself is probed first, so a typo in the
+  repository slug is still an error.
+- `409` (already merged or already scheduled).
+- `405` with "try again later": the PR is still being checked; retried up to 6
+  times.
+- `422` "no commits/changes": the branch is identical to the base.
+- an existing open PR for the same `head`/`base` is reused.
 
 Notes:
 
